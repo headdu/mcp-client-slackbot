@@ -1,0 +1,28 @@
+$schema: https://raw.githubusercontent.com/lastmile-ai/mcp-agent/main/schema/mcp-agent.config.schema.json
+
+execution_engine: asyncio
+logger:
+  transports: [console, file]
+  level: debug
+  progress_display: true
+  path_settings:
+    path_pattern: "logs/mcp-agent-{unique_id}.jsonl"
+    unique_id: "timestamp" # Options: "timestamp" or "session_id"
+    timestamp_format: "%Y%m%d_%H%M%S"
+
+mcp:
+  servers:
+    fetch:
+      command: "uvx"
+      args: ["mcp-server-fetch"]
+    filesystem:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-filesystem"]
+
+openai:
+  # Set default model - API key should be in mcp_agent.secrets.yaml
+  default_model: "gpt-4o-mini"
+
+anthropic:
+  # Set default model - API key should be in mcp_agent.secrets.yaml
+  default_model: "claude-3-7-sonnet-20250219"

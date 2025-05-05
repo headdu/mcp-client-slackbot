@@ -1,0 +1,4 @@
+[project]
+name = "mcp-client-slackbot"
+version = "0.1.0"
+description = "A Slack bot that summarizes thread messages using MCP"

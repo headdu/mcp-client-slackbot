@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+./slackMcp/
+
 # C extensions
 *.so
 
@@ -181,6 +183,10 @@ htmlcov/
 *.swp
 *.swo
 *~
+
+# MCP Agent secrets
+mcp_agent.secrets.yaml
+logs/
 
 # OS specific
 .DS_Store

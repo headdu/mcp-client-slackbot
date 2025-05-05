@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List
 
@@ -13,6 +14,18 @@ from mcp.client.stdio import stdio_client
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
+
+# MCP-Agent imports
+from mcp_agent.app import MCPApp
+from mcp_agent.agents.agent import Agent
+from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+from mcp_agent.workflows.llm.augmented_llm_anthropic import AnthropicAugmentedLLM
+from mcp_agent.workflows.llm.augmented_llm import RequestParams
+from mcp_agent.workflows.llm.llm_selector import ModelPreferences
+
+# Add the parent directory to the path for imports
+# Import the GitHub issue creator
+from github_issue_creator import create_github_issue
 
 # Configure logging
 logging.basicConfig(
@@ -32,6 +45,10 @@ class Configuration:
         self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         self.llm_model = os.getenv("LLM_MODEL", "gpt-4-turbo")
+
+        # GitHub configuration
+        self.github_default_owner = 'sessionlab'
+        self.github_default_repo = 'sessionlab'
 
     @staticmethod
     def load_env() -> None:
@@ -413,6 +430,10 @@ class SlackMCPBot:
         self.conversations = {}  # Store conversation context per channel
         self.tools = []
 
+        # Initialize MCP-Agent components
+        self.mcp_app = MCPApp()
+        self.summarizer_agent = None  # Will be initialized in start method
+
         # Set up event handlers
         self.app.event("app_mention")(self.handle_mention)
         self.app.message()(self.handle_message)
@@ -443,6 +464,20 @@ class SlackMCPBot:
 
     async def handle_mention(self, event, say):
         """Handle mentions of the bot in channels."""
+        # Check if this is a summarization request in a thread
+        text = event.get("text", "").lower()
+        if event.get("thread_ts") and "summarize" in text:
+            logging.info('Handling thread summarization request')
+            await self.handle_thread_summarization(event, say)
+            return
+
+        # Check if this is a GitHub issue creation request in a thread
+        if event.get("thread_ts") and ("create bug" in text or "create github bug" in text):
+            logging.info('Handling GitHub issue creation request')
+            await self.handle_github_issue_creation(event, say)
+            return
+
+        # Otherwise, process as normal
         await self._process_message(event, say)
 
     async def handle_message(self, message, say):
@@ -450,6 +485,425 @@ class SlackMCPBot:
         # Only process direct messages
         if message.get("channel_type") == "im" and not message.get("subtype"):
             await self._process_message(message, say)
+
+    async def handle_thread_summarization(self, event, say):
+        """Handle a thread summarization request."""
+        logging.info('Receive summarization request')
+        channel = event["channel"]
+        thread_ts = event.get("thread_ts")
+
+        if not thread_ts:
+            await say(text="Please tag me within a thread to get a summary.")
+            return
+
+        # Add a reaction to show we're processing
+        try:
+            logging.info('Trying to add reaction')
+            await self.client.reactions_add(
+                channel=channel,
+                timestamp=event["ts"],
+                name="hourglass_flowing_sand"
+            )
+        except Exception as e:
+            logging.warning(f"Could not add reaction: {e}")
+
+        try:
+            # Get thread messages
+            messages = await self._get_thread_messages(channel, thread_ts)
+
+            if not messages:
+                await say(text="No messages found in this thread.", thread_ts=thread_ts)
+                return
+
+            # Format thread for summarization
+            thread_text = self._format_thread_for_summarization(messages)
+
+            # Generate summary
+            summary = await self._summarize_thread(thread_text)
+
+            # Send the summary
+            await say(text=f"*Thread Summary:*\n\n{summary}", thread_ts=thread_ts)
+
+            # Replace processing reaction with success reaction
+            try:
+                await self.client.reactions_remove(
+                    channel=channel,
+                    timestamp=event["ts"],
+                    name="hourglass_flowing_sand"
+                )
+                await self.client.reactions_add(
+                    channel=channel,
+                    timestamp=event["ts"],
+                    name="white_check_mark"
+                )
+            except Exception as e:
+                logging.warning(f"Could not update reactions: {e}")
+
+        except Exception as e:
+            logging.error(f"Error summarizing thread: {e}", exc_info=True)
+            await say(text=f"I encountered an error while summarizing this thread: {str(e)}", thread_ts=thread_ts)
+
+            # Replace processing reaction with error reaction
+            try:
+                await self.client.reactions_remove(
+                    channel=channel,
+                    timestamp=event["ts"],
+                    name="hourglass_flowing_sand"
+                )
+                await self.client.reactions_add(
+                    channel=channel,
+                    timestamp=event["ts"],
+                    name="x"
+                )
+            except Exception:
+                pass
+
+    async def _get_thread_messages(self, channel, thread_ts):
+        """Get all messages in a thread."""
+        try:
+            response = await self.client.conversations_replies(
+                channel=channel,
+                ts=thread_ts
+            )
+
+            if response and "messages" in response:
+                # Filter out any bot messages that are summaries to avoid recursion
+                filtered_messages = []
+                for msg in response["messages"]:
+                    # Skip our own summary messages
+                    if msg.get("user") == self.bot_id and "thread summary" in msg.get("text", "").lower():
+                        continue
+                    filtered_messages.append(msg)
+
+                return filtered_messages
+            return []
+        except Exception as e:
+            logging.error(f"Error fetching thread messages: {e}")
+            return []
+
+    def _format_thread_for_summarization(self, messages):
+        """Format thread messages for summarization."""
+        formatted_text = "Here is the conversation thread:\n\n"
+
+        for i, msg in enumerate(messages):
+            # Get user info
+            user_id = msg.get("user", "unknown")
+            username = f"<@{user_id}>"  # Use Slack user mention format
+
+            # Format the message
+            text = msg.get("text", "").strip()
+            formatted_text += f"Message {i+1} - {username}:\n{text}\n\n"
+
+        return formatted_text
+
+    def _format_thread_for_issue(self, messages):
+        """Format thread messages for GitHub issue creation."""
+        formatted_text = "## Slack Thread Content\n\n"
+
+        for i, msg in enumerate(messages):
+            # Get user info
+            user_id = msg.get("user", "unknown")
+            username = f"@{user_id}"  # Use @ for GitHub markdown
+
+            # Format the message
+            text = msg.get("text", "").strip()
+            formatted_text += f"**Message {i+1} - {username}:**\n{text}\n\n"
+
+        return formatted_text
+
+    async def _summarize_thread(self, thread_text):
+        """Generate a summary using mcp-agent."""
+        try:
+            # Use the existing summarizer_agent
+            if not self.summarizer_agent:
+                logging.error("Summarizer agent not initialized")
+                raise ValueError("Summarizer agent not initialized")
+
+            async with self.summarizer_agent:
+                # Choose LLM based on model name
+                if "gpt" in self.llm_client.model.lower():
+                    llm = await self.summarizer_agent.attach_llm(OpenAIAugmentedLLM)
+                else:
+                    llm = await self.summarizer_agent.attach_llm(AnthropicAugmentedLLM)
+
+                # Configure request parameters
+                request_params = RequestParams(
+                    modelPreferences=ModelPreferences(
+                        costPriority=0.3,
+                        speedPriority=0.2,
+                        intelligencePriority=0.5
+                    )
+                )
+
+                # Generate summary
+                prompt = f"""
+                Please analyze and summarize the following Slack conversation thread.
+
+                Focus on:
+                1. The main topics discussed
+                2. Any key decisions or conclusions reached
+                3. Any action items or next steps mentioned
+                4. The overall sentiment and tone
+
+                Provide a concise but comprehensive summary.
+
+                {thread_text}
+                """
+
+                summary = await llm.generate_str(
+                    message=prompt,
+                    request_params=request_params
+                )
+
+                return summary
+        except Exception as e:
+            logging.error(f"Error in _summarize_thread: {e}", exc_info=True)
+            raise
+
+    async def _extract_issue_details(self, event, thread_text):
+        """Extract GitHub issue details from the request and thread."""
+        try:
+            # Use the GitHub issue creator agent
+            if not self.github_issue_agent:
+                logging.error("GitHub issue agent not initialized")
+                raise ValueError("GitHub issue agent not initialized")
+
+            async with self.github_issue_agent:
+                # Choose LLM based on model name
+                if "gpt" in self.llm_client.model.lower():
+                    llm = await self.github_issue_agent.attach_llm(OpenAIAugmentedLLM)
+                else:
+                    llm = await self.github_issue_agent.attach_llm(AnthropicAugmentedLLM)
+
+                # Configure request parameters
+                request_params = RequestParams(
+                    modelPreferences=ModelPreferences(
+                        costPriority=0.3,
+                        speedPriority=0.2,
+                        intelligencePriority=0.5
+                    )
+                )
+
+                # Extract repository information from the message
+                text = event.get("text", "").lower()
+
+                # Default repository information from configuration
+                config = Configuration()
+                owner = config.github_default_owner
+                repo = config.github_default_repo
+
+                # Try to extract repository information from the message
+                # Format could be "create issue for owner/repo"
+                if "for" in text:
+                    parts = text.split("for", 1)[1].strip().split()
+                    if parts and "/" in parts[0]:
+                        repo_parts = parts[0].split("/")
+                        if len(repo_parts) == 2:
+                            owner = repo_parts[0].strip()
+                            repo = repo_parts[1].strip()
+
+                # Generate a title and body for the issue
+                prompt = f"""
+                Please analyze the following Slack conversation thread and extract information for a GitHub issue.
+
+                Create:
+                1. A clear, concise title for the issue (one line)
+                2. A detailed description for the issue body
+
+                Make sure the title summarizes the main point, and the body provides enough context.
+                Do not include any labels or assignees in your response.
+                Format your answer as JSON with "title" and "body" fields.
+
+                {thread_text}
+                """
+
+                response = await llm.generate_str(
+                    message=prompt,
+                    request_params=request_params
+                )
+
+                # Parse the JSON response
+                try:
+                    import json
+                    details = json.loads(response)
+
+                    # Make sure we have the required fields
+                    if "title" not in details or "body" not in details:
+                        raise ValueError("Missing required fields in issue details")
+
+                    # Add the repository information
+                    details["owner"] = owner
+                    details["repo"] = repo
+
+                    return details
+                except json.JSONDecodeError:
+                    # If the response isn't valid JSON, try to extract title and body manually
+                    title_match = None
+                    body = ""
+
+                    lines = response.split("\n")
+                    for i, line in enumerate(lines):
+                        if "title" in line.lower() and ":" in line:
+                            title_match = line.split(":", 1)[1].strip()
+                            body = "\n".join(lines[i+1:]).strip()
+                            break
+
+                    if not title_match:
+                        # If we can't find a clear title, use the first line
+                        title_match = lines[0].strip()
+                        body = "\n".join(lines[1:]).strip()
+
+                    return {
+                        "title": title_match,
+                        "body": body,
+                        "owner": owner,
+                        "repo": repo
+                    }
+
+        except Exception as e:
+            logging.error(f"Error in _extract_issue_details: {e}", exc_info=True)
+            raise
+
+    async def handle_github_issue_creation(self, event, say):
+        """Handle creating a GitHub issue from a thread."""
+        channel = event["channel"]
+        thread_ts = event.get("thread_ts")
+
+        if not thread_ts:
+            await say(text="Please tag me within a thread to create a GitHub issue.")
+            return
+
+        # Add a reaction to show we're processing
+        try:
+            logging.info('Adding processing reaction for GitHub issue creation')
+            await self.client.reactions_add(
+                channel=channel,
+                timestamp=event["ts"],
+                name="hourglass_flowing_sand"
+            )
+        except Exception as e:
+            logging.warning(f"Could not add reaction: {e}")
+
+        try:
+            # Get thread messages
+            messages = await self._get_thread_messages(channel, thread_ts)
+
+            if not messages:
+                await say(text="No messages found in this thread.", thread_ts=thread_ts)
+                return
+
+            # Format thread for issue creation
+            thread_text = self._format_thread_for_issue(messages)
+
+            # Extract repository information from the message
+            text = event.get("text", "").lower()
+
+            # Default repository information from configuration
+            config = Configuration()
+            owner = config.github_default_owner
+            repo = config.github_default_repo
+
+            # Try to extract repository information from the message
+            # Format could be "create issue for owner/repo"
+            if "for" in text:
+                parts = text.split("for", 1)[1].strip().split()
+                if parts and "/" in parts[0]:
+                    repo_parts = parts[0].split("/")
+                    if len(repo_parts) == 2:
+                        owner = repo_parts[0].strip()
+                        repo = repo_parts[1].strip()
+
+            # Let the user know we're working on it
+            await say(
+                text=f"Creating GitHub issue for {owner}/{repo}...",
+                thread_ts=thread_ts
+            )
+
+            # Determine which LLM to use
+            use_anthropic = "claude" in self.llm_client.model.lower()
+
+            # Use the dedicated agent to create the issue
+            result = await create_github_issue(
+                thread_content=thread_text,
+                owner=owner,
+                repo=repo,
+                use_anthropic=use_anthropic
+            )
+
+            if result["success"]:
+                # Issue created successfully
+                if result.get("issue_url"):
+                    await say(
+                        text=f"✅ GitHub issue created successfully: {result['issue_url']}",
+                        thread_ts=thread_ts
+                    )
+                else:
+                    # We have a success but no URL, include the response
+                    await say(
+                        text=f"✅ GitHub issue created successfully.\n\n{result['response']}",
+                        thread_ts=thread_ts
+                    )
+
+                # Replace processing reaction with success reaction
+                try:
+                    await self.client.reactions_remove(
+                        channel=channel,
+                        timestamp=event["ts"],
+                        name="hourglass_flowing_sand"
+                    )
+                    await self.client.reactions_add(
+                        channel=channel,
+                        timestamp=event["ts"],
+                        name="white_check_mark"
+                    )
+                except Exception as e:
+                    logging.warning(f"Could not update reactions: {e}")
+
+                    #     return
+                    # except Exception as e:
+                    #     logging.error(f"Error creating GitHub issue: {e}", exc_info=True)
+                    #     await say(
+                    #         text=f"❌ Failed to create GitHub issue: {str(e)}",
+                    #         thread_ts=thread_ts
+                    #     )
+
+                    #     # Replace processing reaction with error reaction
+                    #     try:
+                    #         await self.client.reactions_remove(
+                    #             channel=channel,
+                    #             timestamp=event["ts"],
+                    #             name="hourglass_flowing_sand"
+                    #         )
+                    #         await self.client.reactions_add(
+                    #             channel=channel,
+                    #             timestamp=event["ts"],
+                    #             name="x"
+                    #         )
+                    #     except Exception:
+                    #         pass
+
+                    #     return
+
+            # If we get here, we didn't find the GitHub server
+
+        except Exception as e:
+            logging.error(f"Error creating GitHub issue: {e}", exc_info=True)
+            await say(text=f"I encountered an error while creating the GitHub issue: {str(e)}", thread_ts=thread_ts)
+
+            # Replace processing reaction with error reaction
+            try:
+                await self.client.reactions_remove(
+                    channel=channel,
+                    timestamp=event["ts"],
+                    name="hourglass_flowing_sand"
+                )
+                await self.client.reactions_add(
+                    channel=channel,
+                    timestamp=event["ts"],
+                    name="x"
+                )
+            except Exception:
+                pass
 
     async def handle_home_opened(self, event, client):
         """Handle when a user opens the App Home tab."""
@@ -496,7 +950,46 @@ class SlackMCPBot:
                     "type": "mrkdwn",
                     "text": (
                         "*How to Use:*\n• Send me a direct message\n"
-                        "• Mention me in a channel with @MCP Assistant"
+                        "• Mention me in a channel with @MCP Assistant\n"
+                        "• *Thread Summarization:* Tag me in a thread with the word 'summarize' to get a summary of the conversation\n"
+                        "• *GitHub Issue Creation:* Tag me in a thread with 'create issue' to create a GitHub issue from the thread"
+                    ),
+                },
+            }
+        )
+
+        # Add thread summarization section with more details
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*Thread Summarization Feature:*\n"
+                        "I can summarize Slack threads for you! Just:\n"
+                        "1. Reply to any message in a thread\n"
+                        "2. Tag me and include the word 'summarize'\n"
+                        "3. I'll read all messages in the thread and create a concise summary\n"
+                        "4. Great for catching up on long discussions or documenting decisions"
+                    ),
+                },
+            }
+        )
+
+        # Add GitHub issue creation section with details
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "*GitHub Issue Creation Feature:*\n"
+                        "I can create GitHub issues from Slack threads! Just:\n"
+                        "1. Reply to any message in a thread\n"
+                        "2. Tag me and include 'create issue' or 'create github issue'\n"
+                        "3. Optionally specify repository with 'create issue for owner/repo'\n"
+                        "4. I'll create an issue with details extracted from the thread\n"
+                        "5. I'll post back the link to the created issue"
                     ),
                 },
             }
@@ -679,6 +1172,18 @@ After receiving tool results, interpret them for the user in a helpful way.
         """Start the Slack bot."""
         await self.initialize_servers()
         await self.initialize_bot_info()
+
+        # Initialize the summarizer agent
+        self.summarizer_agent = Agent(
+            name="thread_summarizer",
+            instruction="You analyze Slack conversation threads and provide concise summaries.",
+            server_names=[]  # No server needs for basic summarization
+        )
+        logging.info("Thread summarizer agent initialized")
+
+        # Note: We don't need to initialize the GitHub issue creator agent here
+        # since we're using the dedicated agent module instead
+
         # Start the socket mode handler
         logging.info("Starting Slack bot...")
         asyncio.create_task(self.socket_mode_handler.start_async())

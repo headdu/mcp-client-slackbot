@@ -1,104 +1,96 @@
-# MCP Simple Slackbot
+# MCP Client Slackbot
 
-A simple Slack bot that uses the Model Context Protocol (MCP) to enhance its capabilities with external tools.
+A Slack bot that integrates with Model Context Protocol (MCP) servers, including thread summarization features powered by mcp-agent.
 
 ## Features
 
-![2025-03-08-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/0e2b6e1c-80f2-48c3-8ca4-1c41f3678478)
+- Integration with various MCP servers (fetch, sqlite, git, github, etc.)
+- Support for multiple LLM providers (OpenAI, Anthropic, Groq)
+- Handles direct messages and mentions
+- Executes tools through MCP servers
+- **Thread Summarization**: Summarizes Slack conversation threads on demand
 
-- **AI-Powered Assistant**: Responds to messages in channels and DMs using LLM capabilities
-- **MCP Integration**: Full access to MCP tools like SQLite database and web fetching
-- **Multi-LLM Support**: Works with OpenAI, Groq, and Anthropic models
-- **App Home Tab**: Shows available tools and usage information
+## Project Structure
+
+The repository contains two main implementations:
+
+1. **mcp_simple_slackbot**: A standalone Slack bot that integrates with MCP servers
+2. **thread_summarizer.py**: A dedicated thread summarization bot using the mcp-agent framework
+
+## Thread Summarization Feature
+
+The bot can summarize Slack conversation threads! This feature is powered by the mcp-agent library, which provides advanced agent workflows for complex tasks.
+
+### How to use thread summarization:
+
+1. In any Slack thread, mention the bot with the word "summarize"
+   ```
+   @YourBot summarize this thread
+   ```
+
+2. The bot will:
+   - React with a ⏳ emoji to show it's processing
+   - Read all messages in the thread
+   - Generate a comprehensive summary focusing on:
+     - Main topics discussed
+     - Key decisions or conclusions
+     - Action items or next steps
+     - Overall sentiment and tone
+   - Post the summary as a reply in the thread
+   - React with a ✅ emoji when complete
 
 ## Setup
 
-### 1. Create a Slack App
+1. Install dependencies using the virtual environment:
+   ```
+   source slackMcp/bin/activate
+   pip install -r requirements.txt
+   ```
 
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click "Create New App"
-2. Choose "From an app manifest" and select your workspace
-3. Copy the contents of `mcp_simple_slackbot/manifest.yaml` into the manifest editor
-4. Create the app and install it to your workspace
-5. Under the "Basic Information" section, scroll down to "App-Level Tokens"
-6. Click "Generate Token and Scopes" and:
-   - Enter a name like "mcp-assistant"
-   - Add the `connections:write` scope
-   - Click "Generate"
-7. Take note of both your:
-   - Bot Token (`xoxb-...`) found in "OAuth & Permissions"
-   - App Token (`xapp-...`) that you just generated
+2. Configure environment variables:
+   - Copy `.env-example` to `.env` and fill in your Slack tokens and LLM API keys
+   - Copy `mcp_agent.secrets.yaml.example` to `mcp_agent.secrets.yaml` and fill in your LLM API keys
 
-### 2. Install Dependencies
+3. Running the bot:
+   - For the full featured MCP bot:
+     ```
+     cd mcp_simple_slackbot
+     python main.py
+     ```
+   - For just the thread summarizer bot:
+     ```
+     python thread_summarizer.py
+     ```
 
-```bash
-# Create a virtual environment
-python -m venv venv
+## MCP-Agent Configuration
 
-# Activate the virtual environment
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+The thread summarization feature uses the mcp-agent library, which requires configuration via YAML files:
 
-# Install project dependencies
-pip install -r mcp_simple_slackbot/requirements.txt
+- `mcp_agent.config.yaml`: General configuration (already set up)
+- `mcp_agent.secrets.yaml`: API keys (you need to create this from the example)
+
+## Testing
+
+To test the thread summarization functionality without connecting to Slack:
+
 ```
-
-### 3. Configure Environment Variables
-
-Create a `.env` file in the `mcp_simple_slackbot` directory (see `.env.example` for a template):
-
-```
-# Slack API credentials
-SLACK_BOT_TOKEN=xoxb-your-token
-SLACK_APP_TOKEN=xapp-your-token
-
-# LLM API credentials
-OPENAI_API_KEY=sk-your-openai-key
-# or use GROQ_API_KEY or ANTHROPIC_API_KEY
-
-# LLM configuration
-LLM_MODEL=gpt-4-turbo
-```
-
-## Running the Bot
-
-```bash
-# Navigate to the module directory
 cd mcp_simple_slackbot
-
-# Run the bot directly
-python main.py
+python test_summarization.py
 ```
 
-The bot will:
-1. Connect to all configured MCP servers
-2. Discover available tools
-3. Start the Slack app in Socket Mode
-4. Listen for mentions and direct messages
+This script simulates a thread conversation and generates a summary using the same code that powers the thread summarization feature.
 
-## Usage
+## Technical Implementation
 
-- **Direct Messages**: Send a direct message to the bot
-- **Channel Mentions**: Mention the bot in a channel with `@MCP Assistant`
-- **App Home**: Visit the bot's App Home tab to see available tools
+The thread summarization feature uses:
+- `mcp-agent` library for agent workflows
+- `Agent` class with `OpenAIAugmentedLLM` or `AnthropicAugmentedLLM` for LLM integration
+- Contextual prompting with `RequestParams` for high-quality summaries
+- Slack conversations_replies API to fetch thread messages
 
-## Architecture
+## Requirements
 
-The bot is designed with a focused architecture:
-
-1. **SlackMCPBot**: Core class managing Slack events and message processing
-2. **LLMClient**: Handles communication with LLM APIs (OpenAI, Groq, Anthropic)
-3. **Server**: Manages communication with MCP servers
-4. **Tool**: Represents available tools from MCP servers
-
-When a message is received, the bot:
-1. Sends the message to the LLM along with available tools
-2. If the LLM response includes a tool call, executes the tool
-3. Returns the result to the LLM for interpretation
-4. Delivers the final response to the user
-
-## Credits
-
-This project is based on the [MCP Simple Chatbot example](https://github.com/modelcontextprotocol/python-sdk/tree/main/examples/clients/simple-chatbot).
-
-## License
-
-MIT License
+- Python 3.9+
+- Slack Bot & App tokens with appropriate permissions
+- API key for at least one LLM provider (OpenAI or Anthropic)
+- MCP servers as configured in `servers_config.json`
